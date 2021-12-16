@@ -1,0 +1,630 @@
+/* Author: Roman Podchernyaev
+ * Date: 12/02/2021
+ * Project: Portable Plastic-to-Fuel Lab Monitoring System 
+ * Version: 5
+ */
+
+//libraries
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+#include <Adafruit_MLX90614.h>
+#include <LowPower.h>
+#include <EEPROM.h>
+
+
+// Time initialization:
+float startTime = millis();         // Start-up time
+
+// Arduino pin assignments:
+const int buzzer = 13;              // buzzer speaker used for alarm 
+const int pirPin = A4;              // PIR motion sensor
+const int tempPinC = A0;            // LM35 temperature sensor for sensing the compressor temperature connected 
+const int tempPinN = A1;            // LM35 temperature sensor for sensing the nitrogen generator temperature
+const int tempPinB = A15;           // LM35 temperature sensor for sensing power system battery temperature
+const int motorLEDPin = 23;         // LED output pin for indicating safe motor working temperature
+const int batterymotorLEDPinR = 24; // Red LED output pin for indicating battery SOC
+const int batterymotorLEDPinY = 25; // Yellow LED output pin for indicating battery SOC
+const int batterymotorLEDPinG = 26; // Green LED output pin for indicating battery SOC
+const int relayPin = 12;            // Songle Relay IN pin
+const int voltagePinBattery = A2;   // Battery batteryVoltage divider pin
+const int voltagePinMotor = A3;     // Motor batteryVoltage divider pin
+
+
+// PIR sensor definitions:
+long unsigned int lowIn;
+long unsigned int pause = 1000;
+boolean lockLow = true;
+boolean takeLowTime;
+int PIRValue = 0;
+int motion = 0;
+
+
+//LM35 temperature sensor definitions:
+double vout = 0;
+
+
+// MLX motor infrared temperature sensor definitions
+double motorTemp = 0;
+double thresholdTemp = 240;                     //degrees C, threshold value for motor temperature
+//double thresholdTemp = 25;                    //degrees C, threshold value for motor temperature, for testing purposes only
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();    //class member
+
+
+//Honeywell ASDX pressure sensor definitions:
+float a, b, Output, Pressure;
+const long OutMax = 14745, OutMin = 1638;
+const long PressureMax = 30, PressureMin = -30; //PSI
+
+
+//Voltage divider for battery voltage detection definitions:
+const float arduinoVCC = 5.01;  // Volts
+unsigned long R1 = 4700;        // Ohms. 4.7k used for testing
+unsigned long R2 = 4700;        // Ohms.  4.7k used for testing
+double battery = 9;             // Volts. Battery batteryVoltage. 9 volts used during testing
+const int inputResolution = 1023;
+const float numReadings = 500;  // Average of number of data readings
+float batteryVoltage;
+
+
+//Voltage divider for motor voltage detection definitions:
+unsigned long R3 = 4700;        // Ohms. 4.7k used for testing (5k desired for real prototype)
+unsigned long R4 = 100000;      // Ohms  100k used for testing (85k desired for real prototype)
+float motorVoltage;
+
+//Interrupt definitions
+const byte interrupt_pin = 2;
+volatile byte state = LOW;
+
+
+//Motion sensing data storage
+/* the current address in the EEPROM (i.e. which byte I'm going to write to next) */
+int addr = 0;
+
+/* 
+ * LCD display setup
+ * creating a member lcd, defining the lcd register location
+ * and number of display columns and rows 
+*/
+LiquidCrystal_I2C lcd = LiquidCrystal_I2C(0x27,20,4);  
+
+
+void setup() {
+   Serial.begin(19200);                    //set up baudrate 
+   pinMode(pirPin, INPUT);                 //set pin PIR sensor pin as an input
+   pinMode(motorLEDPin, OUTPUT);           //set motor LED pin as an output
+   pinMode(batterymotorLEDPinR, OUTPUT);   //set battery SOC Red LED pin as an output
+   pinMode(batterymotorLEDPinY, OUTPUT);   //set battery SOC Yellow LED pin as an output
+   pinMode(batterymotorLEDPinG, OUTPUT);   //set battery SOC Green LED pin as an output
+   pinMode(relayPin, OUTPUT);              //set relay pin as an output
+   
+    
+   // Initiate the LCD and turn on the backlight
+   lcd.init();                // Initiate the LCD module
+   lcd.backlight();           // Turn on the backlight
+
+   Wire.begin(0x28);                       //set up Honeywell pressure sensor register location
+
+}
+
+
+
+void loop() {
+   float initialTime = 0.001; // Seconds. Assumed time to calculate initial SOC
+   //PIRSensor();
+
+   /*
+
+    Need to divide by 4 because analog inputs range from
+
+    0 to 1023 and each byte of the EEPROM can only hold a
+
+    value from 0 to 255.
+
+  */
+   
+   int val = analogRead(4) / 4;
+
+   /*
+
+    Write the value to the appropriate byte of the EEPROM.
+
+    these values will remain there when the board is
+
+    turned off.
+
+  */
+
+  EEPROM.write(addr, val);
+  int value = EEPROM.read(addr);
+
+  /*
+  Serial.print(addr);
+  Serial.print("\t");
+  Serial.print(value);
+  Serial.println();
+  */
+
+  if (value > 0) {
+   
+    readBatterybatteryVoltage(initialTime);
+    ASDXPressureSensor(); 
+    CompressorLM35TempSensor();
+    NGenLM35TempSensor();
+    BatteryLM35TempSensor();
+    motorControl();
+    MLXTempSensor();
+    
+
+  }
+
+  /*
+
+    Advance to the next address, when at the end restart at the beginning.
+
+  */
+  
+  addr = addr + 1;
+
+  if (addr == EEPROM.length()) {
+    addr = 0;
+
+  }
+
+  
+  delay(100);
+   
+}
+
+
+int PIRSensor() {
+    int motion = 0;
+    
+    if(digitalRead(pirPin) == HIGH) {
+      if(lockLow) {
+         PIRValue = 1;
+         lockLow = false;
+         motion = 1;
+         
+         Serial.println("Motion detected.");       
+         delay(10);
+       }
+      
+      takeLowTime = true;
+    
+    }
+   
+    if(digitalRead(pirPin) == LOW) {
+      if(takeLowTime){
+         lowIn = millis();
+         takeLowTime = false;
+ 
+      }
+      
+      if(!lockLow && millis() - lowIn > pause) {
+         PIRValue = 0;
+         lockLow = true;
+         Serial.println("Motion ended.");
+         delay(10);
+         
+      }
+    }
+
+    return motion;
+}
+
+
+void CompressorLM35TempSensor() {
+  float compressorThreshold = 43.3; //degrees C
+  float nitrogenThreshold = compressorThreshold;
+  
+  float vout = analogRead(tempPinC);
+  float temperature;
+  temperature = (vout * 5000)/(1024 * 10);
+
+  
+  Serial.print("Compressor Temperature: ");
+  Serial.print(temperature);
+  Serial.print(" deg C");
+  Serial.println();
+  delay(1000);
+  
+
+
+  if (temperature >= compressorThreshold) {
+      if (temperature < compressorThreshold) {
+          tone(buzzer, 1000);  // Send buzzer sound signal
+          delay(30000);        // The PTF alarm positive alarm will go off for 30 seconds
+          noTone(buzzer);      // Stop sound
+          
+          lcd.setCursor(0, 0); // Set the cursor on the first column and first row.
+          lcd.print("AIR COMPRESSOR TEMP IS SAFE");
+      }  
+  }
+  
+  
+  /*
+  //LM35 sensor operation test code
+  Serial.print("Temperature = ");
+  Serial.print(vout);
+  Serial.print(" deg C");
+  Serial.println();
+  delay(1000);
+  */
+}
+
+
+void NGenLM35TempSensor() {
+  float nitrogenThreshold = 43.3; //degrees C
+ 
+  float vout = analogRead(tempPinN);
+  float temperature;
+  temperature = (vout * 5000)/(1024 * 10);
+
+  
+  Serial.print("NGen Temperature:       ");
+  Serial.print(temperature);
+  Serial.print(" deg C");
+  Serial.println();
+  delay(1000);
+  
+  
+  if (temperature >= nitrogenThreshold) {
+    
+      if (temperature < nitrogenThreshold) {
+          tone(buzzer, 1000);   // Send 1KHz sound signal
+          delay(30000);         // The PTF alarm positive alarm will go off for 30 seconds
+          noTone(buzzer);      // Stop sound
+          
+          lcd.setCursor(0, 0); // Set the cursor on the first column and first row.
+          lcd.print("N2 GEN TEMP IS SAFE");
+      }
+  }
+
+}
+
+
+void BatteryLM35TempSensor() {
+  float batteryThreshold = 35; //degrees C
+ 
+  float vout = analogRead(tempPinB);
+  float temperature;
+  temperature = (vout * 5000)/(1024 * 10);
+
+  Serial.print("Battery Temperature:    ");
+  Serial.print(temperature);
+  Serial.print(" deg C");
+  Serial.println();
+  delay(1000);  
+  
+  /*
+  if (temperature >= batteryThreshold) {
+    \\apply thermal derating
+  }
+  */
+}
+
+
+/*
+// Test function
+void SongleRelay() {
+  
+  digitalWrite(relayPin, HIGH);
+  delay(3000);
+  digitalWrite(relayPin, LOW);
+  delay(500);
+
+}
+*/
+
+
+void MLXTempSensor() {
+  Serial.print("Motor Temperature:      "); 
+  Serial.print(mlx.readObjectTempC()); //function from mlx sensor library
+  Serial.println(" deg C");
+  Serial.println("\n");
+  delay (1000);
+
+  motorTemp = mlx.readObjectTempC();  
+
+  if (motorTemp > thresholdTemp) {
+
+    digitalWrite(motorLEDPin, HIGH);
+    
+    tone(buzzer, 1000);              // Send sound signal
+    //delay (5000);                  // The PTF alarm positive alarm will go off for 5 seconds (5s for testing purposes only)    
+    delay(30000);                    // The PTF alarm positive alarm will go off for 30 seconds
+    noTone(buzzer);                  // Stop sound
+
+    digitalWrite(motorLEDPin, HIGH); //turn on LED
+    //delay(5000);                   //keep LED on for 5 seconds. (5s for testing purposes only)
+    delay(30000);
+    digitalWrite(motorLEDPin, LOW);  //turn LED off
+
+    lcd.setCursor(0, 0);             // Set the cursor on the first column and first row.
+    lcd.print("MOTORS CAN BE TURNEDON");
+     
+  }
+
+}
+
+
+/*
+void wakeUp() {
+  attachInterrupt(digitalPinToInterrupt(interrupt_pin),interrupt_routine, RISING);
+  LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);   // sleep until interrupt
+  detachInterrupt(digitalPinToInterrupt(interrupt_pin)); // remove interrupt
+  
+  if (state == HIGH){
+    digitalWrite(motorLEDPin, HIGH);
+    Serial.print("I'm on\n");
+    delay(500);
+  }
+  if (state == HIGH){
+    state = LOW;
+    digitalWrite(motorLEDPin, LOW);
+  }
+  
+}
+*/
+/*
+void interrupt_routine(){
+  state = HIGH;
+  Serial.println("interrupt");
+}
+
+*/
+
+
+
+
+void ASDXPressureSensor() {
+   float lowPressure = 16.2; //PSI
+   Wire.requestFrom(0x28, 2);
+   a = Wire.read();
+   b = Wire.read();
+   Output = BitShiftCombine(a, b);
+
+   Pressure = (((Output - OutMin) * (PressureMax - PressureMin)) / (OutMax - OutMin)) + PressureMin;
+
+   Serial.print("Pressure:               ");
+   Serial.print(Pressure); //psi
+   Serial.println(" PSI");
+   delay(1000);
+   
+   
+
+   if (Pressure < lowPressure) {
+      tone(buzzer, 1000);   // Send 1KHz sound signal
+      //delay(3000);          // The PTF alaram will go off for 3 seconds (for testing purposes only)
+      //delay(60000);         // The PTF alarm will go off for 60 seconds
+      noTone(buzzer);       // Stop sound
+
+      lcd.setCursor(0, 0);  // Set the cursor on the first column and first row.
+      lcd.print("LOW LAB PRESSURE DETECTED");
+   }
+   
+  
+}
+
+long BitShiftCombine(unsigned char x_high, unsigned char x_low) {
+  long combined;
+  combined = x_high;              //send x_high to rightmost 8 bits
+  combined = combined << 8;       //shift x_high over to leftmost 8 bits
+  combined |= x_low;              //logical OR keeps x_high in the leftmost 8 bits and fills in the rightmost 8 bits
+  return combined;
+  
+}
+
+void readBatterybatteryVoltage(float initialTime) {
+    /* 
+     
+     batteryVoltage divider formula assumes R1 = 5 kOhm, and a 5V batteryVoltage drop across R1. 
+     R2 = (Vin - 5V) / 0.001 A
+     Examples: for 9 V Battery R2 = 4 kOhm; for 90 V motor R2 = 85 kOhm
+      
+    */
+    float current;
+    float currentThreshold = 0.0001;
+    float SOCi = 100; // Assuming battery initial SOC is 100%. May require verification.
+    float SOC;
+
+    /*
+     * Discover AES battery discharge voltage will change with temperature. 
+     * Thermal rating will be accounted for below.
+     * Assuming the discharge voltage in relation to temperature is constant.
+     * Vmax (100%) occurs within 45-65°C range. 
+     * 
+     * See programming flowchart for discharge voltage in relation to the battery temperature datasheet graph:
+     * https://lucid.app/lucidchart/8a359e04-0a6b-4736-b844-548e66bac424/edit?from_docslist=true&invitationId=inv_bfcfe4b2-3ef3-40f7-a2d6-af8c84d39ee8&page=0_0#
+     */
+
+    float vout = analogRead(tempPinB);
+    float batteryTemp;
+    batteryTemp = (vout * 5000)/(1024 * 10);
+    
+    int batteryVoltageValue = analogRead(voltagePinBattery);
+    float batteryVoltage_sensed = batteryVoltageValue * ( arduinoVCC/(float)inputResolution );      
+    batteryVoltage = batteryVoltage_sensed * (1 + ( (float)R2/(float)R1 )); //true battery batteryVoltage
+
+    if (batteryTemp > 25) {
+      batteryVoltage = batteryVoltage;
+    }
+    
+    if (batteryTemp <= 25 && batteryTemp > 0) {
+      batteryVoltage = 0.99 * batteryVoltage; // 1% reduction in battery voltage 
+    
+    }
+
+    else if (batteryTemp <= 0 && batteryTemp > -10) {
+      batteryVoltage = 0.96 * batteryVoltage; // 4% refuction in battery voltage 
+    }
+
+    else if (batteryTemp <= -10) {
+      batteryVoltage = 0.92 * batteryVoltage; // 8% reduction in battery voltage 
+      
+    }
+
+    
+    Serial.print("Battery Vin:            ");
+    Serial.print(batteryVoltage);
+    Serial.print(" V\n"); 
+    delay(1000);
+    
+    
+    // Coulomb Counting Method. Sampling batteryVoltage across the batteryVoltage divider resistors. 
+    // Battery current is proportional to the current flowing through R1 and R2. 
+    
+    current = batteryVoltage/(R1 + R2);
+    
+    unsigned long currentMillis = millis();
+    unsigned long seconds = currentMillis / 1000;
+    unsigned long minutes = seconds / 60;
+    unsigned long hours = minutes / 60;
+    unsigned long days = hours / 24;
+    currentMillis %= 1000;
+    seconds %= 60;
+    minutes %= 60;
+    hours %= 24;
+    unsigned long elapsedTime = seconds + (minutes * 60) + (hours * 3600); // elapsed time in seconds
+    
+     
+    Serial.print("Battery I:              ");
+    Serial.print(current, 5);
+    Serial.print(" A\n"); 
+    delay(1000);
+    
+
+    
+    //SOCi = (current * (initialTime - startTime)) * 100;           // Test value
+    //SOC = current * elapsedTime;                                  // Test value
+    SOC = ( (current * elapsedTime)/10800 ) * 100;                  // SOC value as a percentage
+    SOC = SOCi - SOC;                                               // Used SOC calculation
+    
+    /*
+    Serial.print("Initial Time: ");
+    Serial.print(initialTime, 3);
+    Serial.print(" s\n"); 
+    delay(1000);
+
+    Serial.print("Start Time: ");
+    Serial.print(startTime, 3);
+    Serial.print(" s\n"); 
+    delay(1000);
+    */
+
+    /*
+    Serial.print("Elapsed Time: ");
+    Serial.print(hours);
+    Serial.print(" ");
+    Serial.print(minutes);
+    Serial.print(" ");
+    Serial.print(seconds);
+    
+    Serial.print(elapsedTime);
+    Serial.print(" s\n"); 
+    delay(1000);
+    */
+
+    /*
+    Serial.print("SOCi: ");
+    Serial.print(SOCi, 5);
+    Serial.print(" C\n"); 
+    delay(1000);
+    */
+
+    Serial.print("Battery SOC:            ");
+    Serial.print(SOC, 1);
+    Serial.print(" %\n"); 
+    delay(1000);
+
+
+    if (SOC <= 20 && current > currentThreshold) {
+      digitalWrite(batterymotorLEDPinR, HIGH);
+      digitalWrite(batterymotorLEDPinY, LOW);
+      digitalWrite(batterymotorLEDPinG, LOW);
+
+      tone(buzzer, 1000);   // Send 1KHz sound signal
+      delay(30000);         // The PTF alarm will go off for 30 seconds
+      noTone(buzzer);       // Stop sound
+
+      lcd.setCursor(0, 0);  // Set the cursor on the first column and first row.
+      lcd.print("NO POWER. IMMEDIATE SHUTOFF");
+      
+    }
+
+    else if (SOC > 20 && SOC <= 30 && current > currentThreshold) {
+      digitalWrite(batterymotorLEDPinR, LOW);
+      digitalWrite(batterymotorLEDPinY, HIGH);
+      digitalWrite(batterymotorLEDPinG, LOW);
+
+      tone(buzzer, 1000);   // Send 1KHz sound signal
+      delay(30000);         // The PTF alarm will go off for 30 seconds
+      noTone(buzzer);       // Stop sound
+
+      lcd.setCursor(0, 0);  // Set the cursor on the first column and first row.
+      lcd.print("DO NOT RUN PTF PROCESS!");
+      
+    }
+
+    else if (SOC > 30 && current > currentThreshold) {
+      digitalWrite(batterymotorLEDPinR, LOW);
+      digitalWrite(batterymotorLEDPinY, LOW);
+      digitalWrite(batterymotorLEDPinG, HIGH);
+    }
+
+
+     else if (current < currentThreshold) {
+      digitalWrite(batterymotorLEDPinR, HIGH);
+      digitalWrite(batterymotorLEDPinY, HIGH);
+      digitalWrite(batterymotorLEDPinG, HIGH);
+      
+    }
+}
+
+void motorControl() {
+    float current;
+    float currentLimit = 2.5;                                                                // Amps
+    int motorVoltageValue = analogRead(voltagePinMotor);
+    float motorVoltage_sensed = motorVoltageValue * ( arduinoVCC/(float)inputResolution );      
+    float motorVoltage = motorVoltage_sensed * (1 + ( (float)R3/(float)R4 ));                //true battery voltage
+
+    /*
+    Serial.print("Vin: ");
+    Serial.print(motorVoltage);
+    Serial.print(" V\n"); 
+    delay(1000);
+    */
+
+    current = motorVoltage/(R3 + R4); // Amps
+
+    
+    Serial.print("Motor I:                ");
+    Serial.print(current, 5);
+    Serial.println(" A"); 
+    delay(1000);
+    
+
+    if (current > currentLimit) {
+        
+        delay (3000);
+
+        if (current > currentLimit) {
+            digitalWrite(relayPin, HIGH);
+            
+            lcd.setCursor(0, 0);  // Set the cursor on the first column and first row.
+            lcd.print("PLEASE WAIT FOR HEATER TEMP TO RISE!");
+            
+            if (current <= currentLimit) {
+              digitalWrite(relayPin, LOW);
+            }
+        }
+      
+    }
+    
+}
+/* //LCD Monitor Test Function
+void LCD() {
+  lcd.setCursor(0, 0); // Set the cursor on the first column and first row.
+  lcd.print("Watermelon"); 
+}
+*/
